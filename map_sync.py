@@ -44,6 +44,35 @@ GALLERY_URL = "https://fotoshare.co/e/jZNLU9GUK7uE22OTnPU3I"
 # Set DEBUG_OCR below to see exactly what the script is reading.
 CROP_BOX = (0.04, 0.82, 0.55, 0.96)
 
+# WHERE THE CONSENT ANSWER SITS ON THE PHOTO.
+#
+# Survey answers never leave the iPad, so the only way this script can
+# know whether a guest agreed to their photo being shown is if LumaBooth
+# prints that answer onto the image, exactly as it prints the city.
+#
+# Set up in LumaBooth:
+#   1. Survey question 1, multiple choice, two options:
+#        "SHOW MY PHOTO"  /  "HIDE MY PHOTO"
+#   2. Print Layout: render that answer in its own area of the photo,
+#      away from the city, and set CONSENT_CROP_BOX to that area.
+#
+# Use long, visually distinct words. Y/N or single letters are far too
+# easily misread, and a misread here is a privacy failure, not a typo.
+CONSENT_CROP_BOX = (0.55, 0.82, 0.96, 0.96)
+
+# The word that means "yes, show my photo". Matched case-insensitively
+# as a substring, so partial OCR ("SHOW MY PH") still counts.
+CONSENT_SHOW_WORD = "show"
+
+# FAIL-SAFE. When True, a photo is only displayed if the consent crop
+# positively reads as CONSENT_SHOW_WORD. Anything else — "HIDE", noise,
+# a blank crop, an OCR failure — hides the photo. The guest still gets
+# a pin and still counts; only the image is withheld.
+#
+# Set to False only if you remove the consent question entirely; then
+# every photo is shown, which is the pre-consent behaviour.
+CONSENT_REQUIRED = True
+
 # Prints the raw OCR output for every photo into the Actions log, and
 # saves the cropped images as a downloadable artifact. Leave this on
 # until you're confident the crop and accuracy are right.
@@ -179,15 +208,10 @@ def fetch_gallery_photos():
 # =====================================================================
 # OCR
 # =====================================================================
-def read_city_from_photo(photo):
-    """Download the photo, crop the region where LumaBooth printed the
-    city, and OCR it. Returns the raw text (possibly empty)."""
-    resp = requests.get(photo["url"], timeout=30)
-    resp.raise_for_status()
-
-    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+def _ocr_region(img, box, photo_id, tag):
+    """Crop one region, preprocess it, and OCR it as a single line."""
     w, h = img.size
-    left, top, right, bottom = CROP_BOX
+    left, top, right, bottom = box
     crop = img.crop((int(w * left), int(h * top), int(w * right), int(h * bottom)))
 
     # Preprocessing: greyscale, upscale, sharpen, then autocontrast.
@@ -202,13 +226,31 @@ def read_city_from_photo(photo):
 
     if DEBUG_OCR:
         os.makedirs(DEBUG_DIR, exist_ok=True)
-        crop.save(os.path.join(DEBUG_DIR, f"{photo['id']}.png"))
+        crop.save(os.path.join(DEBUG_DIR, f"{photo_id}_{tag}.png"))
 
     # psm 7 = "treat the image as a single line of text", which is what
-    # a printed city caption is. Much more accurate here than the
-    # default page-segmentation mode.
-    text = pytesseract.image_to_string(crop, config="--psm 7")
-    return text.strip()
+    # a printed caption is. Much more accurate here than the default
+    # page-segmentation mode.
+    return pytesseract.image_to_string(crop, config="--psm 7").strip()
+
+
+def read_photo_fields(photo):
+    """Download the photo once and OCR both printed regions.
+
+    Returns (raw_city_text, raw_consent_text). Consent text is empty
+    when CONSENT_REQUIRED is off.
+    """
+    resp = requests.get(photo["url"], timeout=30)
+    resp.raise_for_status()
+
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+    raw_city = _ocr_region(img, CROP_BOX, photo["id"], "city")
+    raw_consent = (
+        _ocr_region(img, CONSENT_CROP_BOX, photo["id"], "consent")
+        if CONSENT_REQUIRED else ""
+    )
+    return raw_city, raw_consent
 
 
 def clean_city_text(raw):
@@ -305,7 +347,7 @@ def run_once():
     for photo in new_photos:
         print(f"\n[{photo['id']}]")
         try:
-            raw = read_city_from_photo(photo)
+            raw, raw_consent = read_photo_fields(photo)
         except Exception as e:
             print(f"  could not read photo: {e}")
             continue          # no processed_photos row, so it retries next run
@@ -314,16 +356,28 @@ def run_once():
         if DEBUG_OCR:
             print(f"  OCR raw:     {raw!r}")
             print(f"  OCR cleaned: {city!r}")
+            print(f"  consent raw: {raw_consent!r}")
 
+        # Consent decides whether the IMAGE is shown. It never affects
+        # whether the guest appears or is counted. Fail-safe: anything
+        # that isn't a positive "show" hides the photo.
+        if CONSENT_REQUIRED:
+            show_photo = CONSENT_SHOW_WORD in raw_consent.lower()
+            print(f"  photo: {'shown' if show_photo else 'hidden'}")
+        else:
+            show_photo = True
+
+        # No readable city means the guest didn't give one (or it failed
+        # to read). They still belong on the map, so they go to the
+        # fallback city rather than being dropped.
         if len(city) < MIN_TEXT_LENGTH:
-            print("  nothing readable in the crop — skipping")
-            sb_insert("processed_photos", {
-                "photo_id": photo["id"], "outcome": "no_text", "ocr_text": raw,
-            })
-            continue
-
-        coords = geocode_city(city)
-        located = coords is not None
+            print(f"  no city given — pinning to {FALLBACK_CITY}")
+            city = FALLBACK_CITY
+            coords = {"lat": FALLBACK_LAT, "lng": FALLBACK_LNG}
+            located = False
+        else:
+            coords = geocode_city(city)
+            located = coords is not None
 
         if not located:
             if not FALLBACK_ENABLED:
@@ -335,11 +389,15 @@ def run_once():
             coords = {"lat": FALLBACK_LAT, "lng": FALLBACK_LNG}
             print(f"  could not geocode '{city}' — pinning to {FALLBACK_CITY} instead")
 
+        # When the photo is hidden, the URL is never written to the
+        # database at all. The public page can read the guests table, so
+        # storing the URL and merely not rendering it would still expose
+        # it through the API. Withholding it is the actual protection.
         ok = sb_insert("guests", {
             "city": city,
             "lat": coords["lat"],
             "lng": coords["lng"],
-            "photo_url": photo["url"],
+            "photo_url": photo["url"] if show_photo else None,
             "photo_id": photo["id"],
             "located": located,
         })
